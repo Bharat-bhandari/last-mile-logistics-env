@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.ipynb_checkpoints/
+
+# uv
+.uv/
+
+# OpenEnv
+.openenv_cache/
+results/
+*.log
+
+# Secret
+.env
+
+# System
+.DS_Store
