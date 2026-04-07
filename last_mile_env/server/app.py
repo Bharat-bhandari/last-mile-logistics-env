@@ -1,84 +1,90 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
-"""
-FastAPI application for the Last Mile Env Environment.
-
-This module creates an HTTP server that exposes the LastMileEnvironment
-over HTTP and WebSocket endpoints, compatible with EnvClient.
-
-Endpoints:
-    - POST /reset: Reset the environment
-    - POST /step: Execute an action
-    - GET /state: Get current environment state
-    - GET /schema: Get action/observation schemas
-    - WS /ws: WebSocket endpoint for persistent sessions
-
-Usage:
-    # Development (with auto-reload):
-    uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
-
-    # Production:
-    uvicorn server.app:app --host 0.0.0.0 --port 8000 --workers 4
-
-    # Or run directly:
-    python -m server.app
-"""
+import os
+import random
+from typing import Optional, Dict, Any
+import uvicorn
+import argparse
 
 try:
     from openenv.core.env_server.http_server import create_app
-except Exception as e:  # pragma: no cover
+except ImportError as e:
     raise ImportError(
-        "openenv is required for the web interface. Install dependencies with '\n    uv sync\n'"
+        "openenv is required. Install dependencies with 'uv sync' or 'pip install openenv'"
     ) from e
 
 try:
     from ..models import LastMileAction, LastMileObservation
     from .last_mile_env_environment import LastMileEnvironment
-except ModuleNotFoundError:
+    from ..tasks import Task1Easy, Task2Medium, Task3Hard
+except (ImportError, ModuleNotFoundError):
     from models import LastMileAction, LastMileObservation
     from server.last_mile_env_environment import LastMileEnvironment
+    from tasks import Task1Easy, Task2Medium, Task3Hard
+
+# Task Registry
+TASK_REGISTRY = {
+    "easy": Task1Easy(),
+    "medium": Task2Medium(),
+    "hard": Task3Hard(),
+}
 
 
-# Create the app with web interface and README integration
+class ManagedLastMileEnvironment(LastMileEnvironment):
+    """
+    Extends LastMileEnvironment to support task-based resets.
+    Reads task_id from the options dict passed to reset, falling back to
+    the LMLC_TASK environment variable, then defaulting to 'easy'.
+    """
+
+    def reset(self, options: Optional[Dict[str, Any]] = None) -> Any:
+        # Base reset: clears vehicles, orders, resets state
+        super().reset()
+
+        # Determine task: options dict > env var > default
+        task_name = "easy"
+        if options and "task_id" in options:
+            task_name = options["task_id"]
+        else:
+            task_name = os.getenv("LMLC_TASK", "easy").lower()
+
+        task = TASK_REGISTRY.get(task_name, TASK_REGISTRY["easy"])
+        scenario = task.get_init_state()
+
+        # Apply scenario
+        self.vehicles = scenario["vehicles"]
+        self.orders = scenario["orders"]
+
+        # Seed RNG deterministically for this task
+        seed = scenario.get("seed", 42)
+        self._rng = random.Random(seed)
+
+        # Apply traffic config
+        traffic_config = scenario.get("traffic_config", "dynamic_medium")
+        if traffic_config == "static_low":
+            for k in self.traffic_multipliers:
+                self.traffic_multipliers[k] = 1.0
+        # Other configs start at 1.0 and evolve via _update_traffic()
+
+        return self._get_obs(reward=0.0)
+
+
+# Create the OpenEnv FastAPI application instance
 app = create_app(
-    LastMileEnvironment,
+    ManagedLastMileEnvironment,
     LastMileAction,
     LastMileObservation,
     env_name="last_mile_env",
-    max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
+    max_concurrent_envs=5,
 )
 
 
 def main(host: str = "0.0.0.0", port: int = 8000):
-    """
-    Entry point for direct execution via uv run or python -m.
-
-    This function enables running the server without Docker:
-        uv run --project . server
-        uv run --project . server --port 8001
-        python -m last_mile_env.server.app
-
-    Args:
-        host: Host address to bind to (default: "0.0.0.0")
-        port: Port number to listen on (default: 8000)
-
-    For production deployments, consider using uvicorn directly with
-    multiple workers:
-        uvicorn last_mile_env.server.app:app --workers 4
-    """
-    import uvicorn
-
+    """Entry point for running the server locally."""
     uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8000)
+    parser = argparse.ArgumentParser(description="LMLC Environment Server")
+    parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
     args = parser.parse_args()
-    main(port=args.port)
+    main(host=args.host, port=args.port)

@@ -5,3 +5,17 @@ runtime: fastapi
 app: server.app:app
 port: 8000
 
+tasks:
+  - id: easy
+    name: "Easy - Single Delivery"
+    description: "Single vehicle, single order, static low traffic, generous deadline."
+  - id: medium
+    name: "Medium - Multi-Vehicle Dynamic"
+    description: "Two vehicles, two orders, dynamic traffic with SV Road spikes."
+  - id: hard
+    name: "Hard - High Pressure"
+    description: "One vehicle, three orders, tight deadlines, extreme stochastic traffic."
+
+grader:
+  module: last_mile_env.tasks
+  class: BaseGrader

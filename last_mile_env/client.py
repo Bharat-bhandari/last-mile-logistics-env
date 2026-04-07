@@ -1,98 +1,32 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
-"""Last Mile Env Environment Client."""
-
 from typing import Dict
-
 from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
-
 from .models import LastMileAction, LastMileObservation
 
-
-class LastMileEnv(
-    EnvClient[LastMileAction, LastMileObservation, State]
-):
-    """
-    Client for the Last Mile Env Environment.
-
-    This client maintains a persistent WebSocket connection to the environment server,
-    enabling efficient multi-step interactions with lower latency.
-    Each client instance has its own dedicated environment session on the server.
-
-    Example:
-        >>> # Connect to a running server
-        >>> with LastMileEnv(base_url="http://localhost:8000") as client:
-        ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
-        ...
-        ...     result = client.step(LastMileAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
-
-    Example with Docker:
-        >>> # Automatically start container and connect
-        >>> client = LastMileEnv.from_docker_image("last_mile_env-env:latest")
-        >>> try:
-        ...     result = client.reset()
-        ...     result = client.step(LastMileAction(message="Test"))
-        ... finally:
-        ...     client.close()
-    """
-
+class LastMileEnv(EnvClient[LastMileAction, LastMileObservation, State]):
     def _step_payload(self, action: LastMileAction) -> Dict:
-        """
-        Convert LastMileAction to JSON payload for step message.
-
-        Args:
-            action: LastMileAction instance
-
-        Returns:
-            Dictionary representation suitable for JSON encoding
-        """
-        return {
-            "message": action.message,
-        }
+        return action.model_dump()
 
     def _parse_result(self, payload: Dict) -> StepResult[LastMileObservation]:
-        """
-        Parse server response into StepResult[LastMileObservation].
-
-        Args:
-            payload: JSON response data from server
-
-        Returns:
-            StepResult with LastMileObservation
-        """
         obs_data = payload.get("observation", {})
-        observation = LastMileObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
-            done=payload.get("done", False),
-            reward=payload.get("reward"),
-            metadata=obs_data.get("metadata", {}),
-        )
 
+        # The OpenEnv framework's serialize_observation() strips `done`,
+        # `reward`, and `metadata` from the observation sub-dict and places
+        # them at the envelope level.  Re-inject so LastMileObservation
+        # validation succeeds.
+        obs_data.setdefault("done", payload.get("done", False))
+        obs_data.setdefault("reward", payload.get("reward", 0.0))
+
+        observation = LastMileObservation(**obs_data)
+        
         return StepResult(
             observation=observation,
-            reward=payload.get("reward"),
+            reward=payload.get("reward", 0.0),
             done=payload.get("done", False),
         )
 
     def _parse_state(self, payload: Dict) -> State:
-        """
-        Parse server response into State object.
-
-        Args:
-            payload: JSON response from state request
-
-        Returns:
-            State object with episode_id and step_count
-        """
         return State(
             episode_id=payload.get("episode_id"),
             step_count=payload.get("step_count", 0),

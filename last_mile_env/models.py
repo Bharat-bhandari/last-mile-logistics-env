@@ -1,27 +1,46 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+from pydantic import BaseModel
+from typing import List, Dict, Optional, Any
+from enum import Enum
 
-"""
-Data models for the Last Mile Env Environment.
+class VehicleStatus(str, Enum):
+    IDLE = "idle"
+    MOVING = "moving"
+    LOADING = "loading"
+    BROKEN = "broken"
 
-The last_mile_env environment is a simple test environment that echoes back messages.
-"""
+class Vehicle(BaseModel):
+    id: str
+    location_node: int
+    current_load: List[str] = [] # Fixed: was current_load: int
+    capacity: int
+    status: VehicleStatus
+    destination_node: Optional[int] = None
+    time_to_arrival: float = 0.0 # New: Visible "countdown" for agent planning
 
-from openenv.core.env_server.types import Action, Observation
-from pydantic import Field
+class Order(BaseModel):
+    id: str
+    pickup_node: int
+    dropoff_node: int
+    priority: int 
+    deadline: int 
+    status: str # "queued", "assigned", "delivered", "late"
 
+class LastMileObservation(BaseModel):
+    timestep: int
+    vehicles: List[Vehicle]
+    active_orders: List[Order]
+    traffic_map: Dict[str, float]
+    done: bool
+    reward: float
+    metadata: Dict[str, Any] = {}
 
-class LastMileAction(Action):
-    """Action for the Last Mile Env environment - just a message to echo."""
+class ActionType(str, Enum):
+    ASSIGN = "assign"
+    REROUTE = "reroute"
+    WAIT = "wait"
 
-    message: str = Field(..., description="Message to echo back")
-
-
-class LastMileObservation(Observation):
-    """Observation from the Last Mile Env environment - the echoed message."""
-
-    echoed_message: str = Field(default="", description="The echoed message")
-    message_length: int = Field(default=0, description="Length of the echoed message")
+class LastMileAction(BaseModel):
+    vehicle_id: str
+    action_type: ActionType
+    target_node: Optional[int] = None
+    order_id: Optional[str] = None
