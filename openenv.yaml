@@ -1,9 +1,10 @@
 spec_version: 1
 name: last_mile_env
+env_id: "lmlc-mumbai-v1"
 type: space
 runtime: fastapi
-app: server.app:app
-port: 8000
+app: last_mile_env.server.app:app  # Full path from root
+port: 7860                        # MUST be 7860 for Hugging Face
 
 tasks:
   - id: easy
@@ -17,5 +18,5 @@ tasks:
     description: "One vehicle, three orders, tight deadlines, extreme stochastic traffic."
 
 grader:
-  module: tasks 
+  module: last_mile_env.tasks      # Full path from root
   class: BaseGrader

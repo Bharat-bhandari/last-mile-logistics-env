@@ -1,3 +1,13 @@
+---
+title: Last-Mile Logistics Controller
+emoji: 🚀
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Last-Mile Logistics Controller - OpenEnv Hackathon Submission
 
 Repository for the Last-Mile Logistics Controller environment, used for OpenEnv evaluations.
