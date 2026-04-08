@@ -58,9 +58,9 @@ The agent monitors the environment state through a strongly-typed `LastMileObser
 ```bash
 cd last_mile_env
 uv sync
-uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn server.app:app --host 0.0.0.0 --port 7860 --reload
 ```
-Server runs on `http://localhost:8000`.
+Server runs on `http://localhost:7860`.
 
 ### Validate Manifest
 Ensure `openenv` package is installed:
@@ -73,7 +73,7 @@ openenv validate
 Build and run the container locally:
 ```bash
 docker build -t last-mile-logistics:latest .
-docker run --rm -p 8000:8000 last-mile-logistics:latest
+docker run --rm -p 7860:7860 last-mile-logistics:latest
 ```
 
 ### Run Inference Script

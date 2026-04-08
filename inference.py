@@ -435,7 +435,7 @@ async def main() -> None:
     previous_node: Optional[int] = None
     last_known_location: Optional[int] = None
 
-    async with LastMileEnv(base_url="http://localhost:8000") as env:
+    async with LastMileEnv(base_url="http://localhost:7860") as env:
         emit_start(task=TASK_NAME, model=MODEL_NAME)
 
         try:

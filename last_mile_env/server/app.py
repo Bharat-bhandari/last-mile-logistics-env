@@ -82,7 +82,7 @@ app = create_app(
 )
 
 
-def main(host: str = "0.0.0.0", port: int = 8000):
+def main(host: str = "0.0.0.0", port: int = 7860):
     """Entry point for running the server locally."""
     uvicorn.run(app, host=host, port=port)
 
