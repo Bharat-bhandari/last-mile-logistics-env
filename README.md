@@ -7,7 +7,6 @@ Repository for the Last-Mile Logistics Controller environment used in OpenEnv ev
 - `last_mile_env/`: environment package (server, models, tasks, grader, manifest)
 - `Dockerfile`: container build
 - `inference.py`: agent evaluator script
-- `copilot-instructions.md`: development guide
 
 ## Quick Start
 

@@ -2,7 +2,7 @@ import asyncio
 import os
 import textwrap
 import json
-from typing import List, Optional
+from typing import List, Optional, Any
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -24,7 +24,7 @@ TEMPERATURE = 0.2
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
-    You are a Senior Logistics Dispatcher for Santacruz, Mumbai.
+    You are a state-aware logistics dispatcher in the Santacruz LMLC environment.
 
     **Graph (directed edges with base travel times):**
     - 0 (Station) → 1 (SV_Road) [5 min]
@@ -34,35 +34,55 @@ SYSTEM_PROMPT = textwrap.dedent(
     - 2 (Linking_Road) → 3 (Juhu_Tara) [7 min]
     - 3 (Juhu_Tara) → 2 (Linking_Road) [7 min]
 
-    Actual travel time = base_time × traffic_multiplier for that edge.
-    SV_Road (Node 1) edges frequently spike to 2x-5x multiplier.
+    STRICT DECISION POLICY (FOLLOW EXACTLY):
 
-    **Goal:** Deliver all orders before their deadlines.
-    - On-time delivery: +20 reward
-    - Late delivery: +5 reward
-    - Order exceeding deadline undelivered: -10 penalty
-    - Each step costs -0.1
-    - Rerouting costs -2.0
+    Step 1: Check vehicle status
 
-    **Actions (one per step):**
-    - "assign": Move idle vehicle to adjacent node. Requires vehicle_id, target_node.
-    - "reroute": Redirect a moving vehicle to a different adjacent node. Requires vehicle_id, target_node.
-    - "wait": Keep vehicle idle. Requires vehicle_id.
+    * If status == "moving":
+      → You MUST output:
+      {"type": "WAIT", "payload": {}}
+      → Do NOT assign or reroute
 
-    **Strategy hints:**
-    - Vehicles can only move to ADJACENT nodes (one hop at a time).
-    - Plan multi-hop routes by issuing assign/reroute one hop at a time.
-    - Avoid SV_Road (Node 1) when its traffic multiplier is high.
-    - Pick up orders by having a vehicle arrive at the pickup_node.
-    - Deliver orders by having a vehicle arrive at the dropoff_node while carrying the order.
-    - Prioritize high-priority and tight-deadline orders.
+    Step 2: If status == "idle":
 
-    Reply ONLY with a JSON object:
+    * If vehicle is at pickup node of an undelivered order:
+      → assign next hop toward drop node
+
+    Step 3: Multi-hop routing rule
+
+    * You CANNOT jump directly to destination
+    * Example: 0 → 2 requires:
+      Step A: assign to 1
+      Step B: wait until arrival
+      Step C: assign to 2
+
+    Step 4: Reroute rule
+
+    * Only reroute if traffic multiplier > 3.0
+    * Otherwise NEVER reroute
+
+    Step 5: Anti-loop rule (CRITICAL)
+
+    * Do NOT repeat ASSIGN if vehicle is already moving
+    * Repeated ASSIGN = invalid behavior
+
+    Goal:
+    Complete delivery for the active order with minimum steps.
+
+    ---
+
+    Before outputting action:
+
+    * Check: Is vehicle moving?
+    * If YES → WAIT
+    * If NO → ASSIGN next valid hop
+
+    ---
+
+    Output ONLY valid JSON:
     {
-      "vehicle_id": "v1",
-      "action_type": "assign" | "reroute" | "wait",
-      "target_node": <int or null>,
-      "order_id": "<str or null>"
+    "type": "...",
+    "payload": {...}
     }
     """
 ).strip()
@@ -72,21 +92,38 @@ def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
-def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
-    error_val = error if error else "null"
+def log_step(step: int, action: str, reward: float, done: bool, result: Optional[Any] = None) -> None:
+    print(f"\n--- STEP {step} ---", flush=True)
+    print(f"Action: {action}", flush=True)
+    print(f"Reward: {reward:.2f}", flush=True)
+    print(f"Done: {str(done).lower()}", flush=True)
+    
+    if result and hasattr(result, "observation"):
+        obs = result.observation
+        print("Vehicles Status:", flush=True)
+        for v in obs.vehicles:
+            dest = f" -> {v.destination_node}" if v.destination_node is not None else ""
+            etr = f" (ETR: {v.time_to_arrival:.1f})" if v.status == "moving" else ""
+            print(f"  - {v.id}: {v.location_node}{dest} [{v.status}]{etr}", flush=True)
+        
+        print("Active Orders:", flush=True)
+        for o in obs.active_orders:
+            print(f"  - {o.id}: {o.pickup_node}->{o.dropoff_node} [{o.status}] Priority: {o.priority} Deadline: {o.deadline}", flush=True)
+        
+        high_traffic = {k: v for k, v in obs.traffic_map.items() if v > 1.5}
+        if high_traffic:
+            print("High Traffic:", flush=True)
+            for edge, mult in high_traffic.items():
+                print(f"  - {edge}: {mult:.2f}x", flush=True)
+    print("-" * 15, flush=True)
+
+
+def log_end(success: bool, steps: int, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else "0.00"
     print(
-        f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={error_val}",
+        f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}",
         flush=True,
     )
-
-
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(
-        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
-        flush=True,
-    )
-
 
 def get_agent_action(client: OpenAI, obs_json: str) -> LastMileAction:
     try:
@@ -100,12 +137,47 @@ def get_agent_action(client: OpenAI, obs_json: str) -> LastMileAction:
             response_format={"type": "json_object"},
         )
         content = completion.choices[0].message.content
+        
+        print(f"\nDEBUG LLM Action Decision:", flush=True)
+        print(f"Response: {content}", flush=True) 
+        
         data = json.loads(content)
+        
+        # Ensure data is a dictionary before unpacking
+        if not isinstance(data, dict):
+            raise ValueError("LLM did not return a JSON object")
+            
+        if "type" in data and "payload" in data:
+            action_type = data.get("type", "wait").lower()
+            payload = data.get("payload", {})
+            target_node = payload.get("target_node")
+            if target_node is None:
+                target_node = payload.get("next_hop")
+            if target_node is None:
+                target_node = payload.get("next_node")
+            if target_node is None:
+                target_node = payload.get("destination_node")
+                
+            return LastMileAction(
+                vehicle_id=payload.get("vehicle_id", "v1"),
+                action_type=action_type,
+                target_node=target_node,
+                order_id=payload.get("order_id")
+            )
+            
         return LastMileAction(**data)
-    except Exception:
-        # Fallback to WAIT if LLM fails or returns invalid JSON
-        return LastMileAction(vehicle_id="v1", action_type="wait")
 
+    except Exception as e:
+        # CRITICAL: Print the error so you know if it's a Credit Limit issue
+        print(f"[ERROR] Agent Action Failed: {e}", flush=True)
+        
+        # Fallback: Explicitly use None for optional fields to avoid Server validation errors
+        return LastMileAction(
+            vehicle_id="v1", 
+            action_type="wait", 
+            target_node=None, 
+            order_id=None
+        )
 
 async def main() -> None:
     rewards: List[float] = []
@@ -132,6 +204,9 @@ async def main() -> None:
                 obs_json = result.observation.model_dump_json()
                 action = get_agent_action(client, obs_json)
 
+                # Add a small delay to prevent Rate Limits
+                await asyncio.sleep(1)
+
                 result = await env.step(action)
 
                 reward = result.reward or 0.0
@@ -143,7 +218,7 @@ async def main() -> None:
                     action=action.action_type,
                     reward=reward,
                     done=result.done,
-                    error=None,
+                    result=result,
                 )
 
                 if result.done:
@@ -162,7 +237,7 @@ async def main() -> None:
         except Exception as e:
             print(f"[ERROR] Inference loop failed: {e}", flush=True)
         finally:
-            log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+            log_end(success=success, steps=steps_taken, rewards=rewards)
 
 
 if __name__ == "__main__":

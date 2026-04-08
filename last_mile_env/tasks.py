@@ -1,6 +1,8 @@
+import logging
 from typing import List, Dict, Any
 from .models import Order, Vehicle, VehicleStatus
 
+logger = logging.getLogger("LastMileTasks")
 
 class BaseGrader:
     """Deterministic scorer for Logistics Tasks."""
@@ -23,7 +25,9 @@ class BaseGrader:
         score = (0.7 * (delivered_count / len(orders))) + (
             0.3 * (on_time_count / len(orders))
         )
-        return round(min(max(score, 0.0), 1.0), 2)
+        final_score = round(min(max(score, 0.0), 1.0), 2)
+        logger.info(f"Final score calculated: {final_score} (Delivered: {delivered_count}/{len(orders)}, On-time: {on_time_count}/{len(orders)})")
+        return final_score
 
 
 class Task1Easy:
@@ -32,6 +36,7 @@ class Task1Easy:
     SEED = 100
 
     def get_init_state(self) -> Dict[str, Any]:
+        logger.info("Initializing Easy Task")
         return {
             "vehicles": [
                 Vehicle(
@@ -63,6 +68,7 @@ class Task2Medium:
     SEED = 200
 
     def get_init_state(self) -> Dict[str, Any]:
+        logger.info("Initializing Medium Task")
         return {
             "vehicles": [
                 Vehicle(
@@ -109,6 +115,7 @@ class Task3Hard:
     SEED = 300
 
     def get_init_state(self) -> Dict[str, Any]:
+        logger.info("Initializing Hard Task")
         return {
             "vehicles": [
                 Vehicle(

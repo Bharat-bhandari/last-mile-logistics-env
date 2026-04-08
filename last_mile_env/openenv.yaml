@@ -17,5 +17,5 @@ tasks:
     description: "One vehicle, three orders, tight deadlines, extreme stochastic traffic."
 
 grader:
-  module: last_mile_env.tasks
+  module: tasks 
   class: BaseGrader

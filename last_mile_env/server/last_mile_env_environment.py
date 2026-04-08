@@ -1,8 +1,16 @@
 import random
+import logging
 from uuid import uuid4
 from typing import List, Dict, Optional, Any
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("LastMileEnv")
 
 try:
     from ..models import (
@@ -59,11 +67,13 @@ class LastMileEnvironment(Environment):
 
     def _update_traffic(self):
         for key in self.traffic_multipliers:
+            old_val = self.traffic_multipliers[key]
             if self._rng.random() < 0.10:
                 if "1" in key:
                     self.traffic_multipliers[key] = self._rng.uniform(2.0, 5.0)
                 else:
                     self.traffic_multipliers[key] = self._rng.uniform(1.2, 2.5)
+                logger.info(f"Traffic update: {key} changed from {old_val:.2f} to {self.traffic_multipliers[key]:.2f}")
             else:
                 self.traffic_multipliers[key] = max(
                     1.0, self.traffic_multipliers[key] * 0.9
@@ -85,11 +95,13 @@ class LastMileEnvironment(Environment):
                         5,
                     )
                     v.time_to_arrival = base * traffic
+                    logger.info(f"Vehicle {v.id} started moving from {v.location_node} to {v.destination_node}. ETR: {v.time_to_arrival:.2f}")
 
                 # Progress: 1 step = 1 time-unit
                 v.time_to_arrival -= 1.0
 
                 if v.time_to_arrival <= 0:
+                    logger.info(f"Vehicle {v.id} arrived at node {v.destination_node}")
                     v.time_to_arrival = 0.0
                     v.location_node = v.destination_node
                     v.destination_node = None
@@ -116,6 +128,7 @@ class LastMileEnvironment(Environment):
 
     def step(self, action: LastMileAction) -> LastMileObservation:
         self._state.step_count += 1
+        logger.info(f"Step {self._state.step_count}: Received action {action.action_type} for vehicle {action.vehicle_id}")
         self._update_traffic()
 
         # --- Apply Action ---
@@ -124,89 +137,54 @@ class LastMileEnvironment(Environment):
         vehicle = next((v for v in self.vehicles if v.id == action.vehicle_id), None)
         if vehicle is not None:
             if action.action_type == ActionType.ASSIGN and action.target_node is not None:
-                # Assign: start moving vehicle to target node (must be adjacent)
-                if vehicle.status != VehicleStatus.MOVING:
+                # FIX: Only allow assignment if the vehicle is IDLE. 
+                # If MOVING, we ignore to prevent teleportation/resetting mid-trip.
+                if vehicle.status == VehicleStatus.IDLE:
                     if self._is_adjacent(vehicle.location_node, action.target_node):
+                        logger.info(f"Action applied: Assign {vehicle.id} to node {action.target_node}")
                         vehicle.destination_node = action.target_node
                         vehicle.status = VehicleStatus.MOVING
-                        vehicle.time_to_arrival = 0  # will be computed in _move_vehicles
+                        # Reset arrival time to 0 so _move_vehicles calculates it correctly
+                        vehicle.time_to_arrival = 0 
+                    else:
+                        logger.warning(f"Action rejected: Node {action.target_node} is not adjacent to {vehicle.location_node}")
+                else:
+                    logger.warning(f"Action rejected: Vehicle {vehicle.id} is already moving")
 
             elif action.action_type == ActionType.REROUTE and action.target_node is not None:
-                # Reroute: redirect a moving vehicle to a new adjacent node
+                # Reroute: redirect a moving vehicle to a DIFFERENT adjacent node
                 if vehicle.status == VehicleStatus.MOVING:
                     if self._is_adjacent(vehicle.location_node, action.target_node):
-                        vehicle.destination_node = action.target_node
-                        vehicle.time_to_arrival = 0  # recompute travel time
-                        reward -= 2.0  # rerouting penalty
+                        # Only apply penalty if the target is actually changing
+                        if vehicle.destination_node != action.target_node:
+                            logger.info(f"Action applied: Reroute {vehicle.id} to node {action.target_node}")
+                            vehicle.destination_node = action.target_node
+                            vehicle.time_to_arrival = 0 # Force recalculation
+                            reward -= 2.0  # rerouting penalty
+                    else:
+                        logger.warning(f"Action rejected: Node {action.target_node} is not adjacent to {vehicle.location_node}")
                 elif vehicle.status == VehicleStatus.IDLE:
-                    # If idle, treat reroute as assign
                     if self._is_adjacent(vehicle.location_node, action.target_node):
+                        logger.info(f"Action applied: Reroute (Assign) {vehicle.id} to node {action.target_node}")
                         vehicle.destination_node = action.target_node
                         vehicle.status = VehicleStatus.MOVING
                         vehicle.time_to_arrival = 0
+                    else:
+                        logger.warning(f"Action rejected: Node {action.target_node} is not adjacent to {vehicle.location_node}")
 
             elif action.action_type == ActionType.WAIT:
-                # Wait: keep vehicle idle at current location
-                if vehicle.status != VehicleStatus.MOVING:
-                    vehicle.status = VehicleStatus.IDLE
+                # If an agent explicitly calls WAIT, it's fine. 
+                # If MOVING, it continues moving. If IDLE, it stays IDLE.
+                logger.info(f"Action applied: Vehicle {vehicle.id} is waiting")
+                if vehicle.status == VehicleStatus.IDLE:
                     vehicle.destination_node = None
+        else:
+            logger.error(f"Vehicle {action.vehicle_id} not found")
 
-        # --- Move Vehicles ---
         self._move_vehicles()
 
-        # --- Order Lifecycle ---
-        for o in self.orders:
-            if o.status == "queued":
-                # Auto-pickup: if any vehicle is at pickup node and has capacity
-                for v in self.vehicles:
-                    if (
-                        v.location_node == o.pickup_node
-                        and v.status == VehicleStatus.IDLE
-                        and len(v.current_load) < v.capacity
-                    ):
-                        o.status = "assigned"
-                        v.current_load.append(o.id)
-                        break
-
-            elif o.status == "assigned":
-                # Auto-deliver: if carrying vehicle is at dropoff node
-                for v in self.vehicles:
-                    if (
-                        v.location_node == o.dropoff_node
-                        and o.id in v.current_load
-                    ):
-                        o.status = "delivered"
-                        v.current_load.remove(o.id)
-                        # Reward: on-time vs late
-                        if self._state.step_count <= o.deadline:
-                            reward += 20.0
-                        else:
-                            reward += 5.0
-                        break
-
-        # --- Mark late orders that exceeded deadline but weren't delivered ---
-        for o in self.orders:
-            if o.status in ("queued", "assigned") and self._state.step_count > o.deadline:
-                o.status = "late"
-                reward -= 10.0
-
-        # --- Determine done ---
-        all_terminal = all(o.status in ("delivered", "late") for o in self.orders)
-        done = (
-            (all_terminal and len(self.orders) > 0)
-            or self._state.step_count >= self.max_steps
-        )
-
-        obs = self._get_obs(reward=reward, done=done)
-
-        # If episode ended, compute final grader score and add to metadata
-        if done:
-            final_score = self.grader.calculate_score(
-                self.vehicles, self.orders, self._state.step_count
-            )
-            obs.metadata["final_score"] = final_score
-            obs.metadata["grader"] = "BaseGrader"
-
+        obs = self._get_obs(reward=reward)
+        logger.debug(f"Observation after step: {obs.model_dump_json()}")
         return obs
 
     def _get_obs(self, reward: float, done: Optional[bool] = None) -> LastMileObservation:
