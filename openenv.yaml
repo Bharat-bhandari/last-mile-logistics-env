@@ -10,13 +10,25 @@ tasks:
   - id: easy
     name: "Easy - Single Delivery"
     description: "Single vehicle, single order, static low traffic, generous deadline."
+    grader:
+      module: last_mile_env.tasks
+      class: BaseGrader
+
   - id: medium
     name: "Medium - Multi-Vehicle Dynamic"
     description: "Two vehicles, two orders, dynamic traffic with SV Road spikes."
+    grader:
+      module: last_mile_env.tasks
+      class: BaseGrader
+
   - id: hard
     name: "Hard - High Pressure"
     description: "One vehicle, three orders, tight deadlines, extreme stochastic traffic."
+    grader:
+      module: last_mile_env.tasks
+      class: BaseGrader
 
+# Top-level grader (fallback / default)
 grader:
-  module: last_mile_env.tasks      # Full path from root
+  module: last_mile_env.tasks
   class: BaseGrader
