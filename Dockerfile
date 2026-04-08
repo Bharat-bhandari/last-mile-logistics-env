@@ -24,12 +24,13 @@ RUN apt-get update && \
 ARG BUILD_MODE=in-repo
 ARG ENV_NAME=last_mile_env
 
-# Copy environment code from the nested directory
-COPY last_mile_env /app/env
+# Copy project dependencies and environment code
+COPY pyproject.toml README.md uv.lock /app/
+COPY last_mile_env /app/last_mile_env
 
 # For in-repo builds, openenv is already vendored in the build context
 # For standalone builds, openenv will be installed via pyproject.toml
-WORKDIR /app/env
+WORKDIR /app
 
 # Ensure uv is available (for local builds where base image lacks it)
 RUN if ! command -v uv >/dev/null 2>&1; then \
@@ -60,21 +61,21 @@ FROM ${BASE_IMAGE}
 WORKDIR /app
 
 # Copy the virtual environment from builder
-COPY --from=builder /app/env/.venv /app/.venv
+COPY --from=builder /app/.venv /app/.venv
 
 # Copy the environment code
-COPY --from=builder /app/env /app/env
+COPY --from=builder /app/last_mile_env /app/last_mile_env
 
 # Set PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Set PYTHONPATH so imports work correctly
-ENV PYTHONPATH="/app/env:$PYTHONPATH"
+ENV PYTHONPATH="/app:$PYTHONPATH"
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:7860/health || exit 1
 
 # Run the FastAPI server
-# The module path is constructed to work with the /app/env structure
-CMD ["sh", "-c", "cd /app/env && uvicorn server.app:app --host 0.0.0.0 --port 7860"]
+# The module path is constructed to work with the /app structure
+CMD ["sh", "-c", "uvicorn last_mile_env.server.app:app --host 0.0.0.0 --port 7860"]
