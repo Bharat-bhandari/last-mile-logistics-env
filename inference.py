@@ -16,7 +16,6 @@ import asyncio
 import json
 import os
 import re
-import sys
 from collections import deque
 from typing import Any, Dict, List, Optional
 
@@ -29,21 +28,18 @@ from last_mile_env import LastMileEnv, LastMileAction
 
 load_dotenv()
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4.1-mini")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 if not HF_TOKEN:
-    print("[FATAL] HF_TOKEN environment variable is required but not set.", flush=True)
-    sys.exit(1)
+    print("[WARN] HF_TOKEN is not set — LLM calls will fail unless the platform injects it.", flush=True)
 
 TASK_NAME = os.getenv("LMLC_TASK", "easy")
 BENCHMARK = "last_mile_logistics_controller"
 MAX_STEPS = 200
 
-# ── OpenAI Client ────────────────────────────────────────────────────────────
-
-client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+# ── OpenAI Client (created inside main() to respect runtime env vars) ────────
 
 # ── Graph Definition (mirrors server) ────────────────────────────────────────
 
@@ -343,6 +339,7 @@ def _extract_json(text: str) -> Optional[Dict]:
 
 
 def get_llm_action(
+    client: OpenAI,
     obs_dict: Dict[str, Any],
     previous_node: Optional[int] = None,
 ) -> tuple[LastMileAction, Optional[str]]:
@@ -415,11 +412,11 @@ def emit_step(
     )
 
 
-def emit_end(success: bool, steps: int, rewards: List[float]) -> None:
+def emit_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     reward_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
         f"[END] success={str(success).lower()} steps={steps} "
-        f"rewards={reward_str}",
+        f"score={score:.2f} rewards={reward_str}",
         flush=True,
     )
 
@@ -427,9 +424,12 @@ def emit_end(success: bool, steps: int, rewards: List[float]) -> None:
 # ── Main Loop ────────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+
     rewards: List[float] = []
     steps_taken = 0
     success = False
+    score = 0.0
 
     # Movement history tracking for anti-backtracking
     previous_node: Optional[int] = None
@@ -463,7 +463,7 @@ async def main() -> None:
                         last_known_location = current_location
 
                 # Ask the LLM for the next action
-                action, error = get_llm_action(obs_dict, previous_node=previous_node)
+                action, error = get_llm_action(client, obs_dict, previous_node=previous_node)
 
                 # Execute the action in the environment
                 result = await env.step(action)
@@ -491,8 +491,9 @@ async def main() -> None:
                 # Check for episode completion
                 if result.done:
                     meta = getattr(result.observation, "metadata", {}) or {}
-                    if meta.get("final_score"):
-                        success = meta["final_score"] > 0.4
+                    if meta.get("final_score") is not None:
+                        score = float(meta["final_score"])
+                        success = score > 0.4
                     else:
                         all_delivered = all(
                             o.status == "delivered"
@@ -501,6 +502,7 @@ async def main() -> None:
                         success = all_delivered and bool(
                             result.observation.active_orders
                         )
+                        score = 1.0 if success else 0.0
                     break
 
         except Exception as e:
@@ -513,7 +515,7 @@ async def main() -> None:
                 error=str(e),
             )
         finally:
-            emit_end(success=success, steps=steps_taken, rewards=rewards)
+            emit_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
 if __name__ == "__main__":

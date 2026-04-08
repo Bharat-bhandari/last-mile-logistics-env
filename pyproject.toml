@@ -14,18 +14,12 @@ version = "0.1.0"
 description = "Last Mile Env environment for OpenEnv"
 requires-python = ">=3.10"
 dependencies = [
-    # Core OpenEnv runtime (provides FastAPI server + HTTP client types)
-    # install from github
-    # "openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git",
     "openenv-core[core]>=0.2.2",
-    # Environment-specific dependencies
-    # Add all dependencies needed for your environment here
-    # Examples:
-    # "numpy>=1.19.0",
-    # "torch>=2.0.0",
-    # "gymnasium>=0.29.0",
-    # "openspiel>=1.0.0",
-    # "smolagents>=1.22.0,<2",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "openai",
+    "python-dotenv"
 ]
 
 [project.optional-dependencies]
@@ -35,11 +29,13 @@ dev = [
 ]
 
 [project.scripts]
-# Server entry point - enables running via: uv run --project . server
-# or: python -m last_mile_env.server.app
+# Enables running via: uv run server
 server = "last_mile_env.server.app:main"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["last_mile_env", "last_mile_env.server"]
-package-dir = { "last_mile_env" = ".", "last_mile_env.server" = "server" }
+
+[tool.setuptools.packages.find]
+# Searches the root for the 'last_mile_env' folder and includes it as a package
+where = ["."]
+include = ["last_mile_env*"]
