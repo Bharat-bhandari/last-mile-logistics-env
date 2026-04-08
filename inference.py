@@ -1,243 +1,519 @@
-import asyncio
-import os
-import textwrap
-import json
-from typing import List, Optional, Any
+"""
+inference.py – LLM-based agent for the Last-Mile Logistics Controller (LMLC).
 
-from openai import OpenAI
+Uses the OpenAI SDK to query an LLM at each environment step.  The LLM
+receives a structured text prompt describing the current observation and
+must return a JSON action conforming to the LastMileAction Pydantic model.
+
+Anti-Ping-Pong Architecture:
+  - BFS-based next-hop computation eliminates directional ambiguity.
+  - Movement history tracking forbids backtracking.
+  - Explicit ACTION DIRECTIVE tells the LLM exactly what to do.
+  - When vehicle is MOVING, the LLM receives a pre-built WAIT JSON.
+"""
+
+import asyncio
+import json
+import os
+import re
+import sys
+from collections import deque
+from typing import Any, Dict, List, Optional
+
 from dotenv import load_dotenv
+from openai import OpenAI
+
 from last_mile_env import LastMileEnv, LastMileAction
 
-# Configuration
+# ── Configuration ────────────────────────────────────────────────────────────
+
 load_dotenv()
 
-# Environment Variables
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
-MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4.1-mini")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+if not HF_TOKEN:
+    print("[FATAL] HF_TOKEN environment variable is required but not set.", flush=True)
+    sys.exit(1)
+
 TASK_NAME = os.getenv("LMLC_TASK", "easy")
 BENCHMARK = "last_mile_logistics_controller"
-
-# Hyperparameters
 MAX_STEPS = 200
-TEMPERATURE = 0.2
 
-SYSTEM_PROMPT = textwrap.dedent(
+# ── OpenAI Client ────────────────────────────────────────────────────────────
+
+client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+
+# ── Graph Definition (mirrors server) ────────────────────────────────────────
+
+ADJ_LIST: Dict[int, List[int]] = {
+    0: [1, 4, 7],
+    1: [0, 2, 5],
+    2: [1, 3, 7],
+    3: [2, 6],
+    4: [0, 5],
+    5: [4, 1, 6],
+    6: [5, 3],
+    7: [0, 2],
+}
+
+
+def bfs_next_hop(start: int, goal: int) -> Optional[int]:
+    """Return the first node on the shortest path from start to goal.
+    Returns None if start == goal or no path exists."""
+    if start == goal:
+        return None
+    visited = {start}
+    # queue entries: (current_node, first_hop)
+    queue = deque()
+    for neighbor in ADJ_LIST.get(start, []):
+        if neighbor == goal:
+            return neighbor
+        queue.append((neighbor, neighbor))
+        visited.add(neighbor)
+    while queue:
+        current, first_hop = queue.popleft()
+        for neighbor in ADJ_LIST.get(current, []):
+            if neighbor == goal:
+                return first_hop
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append((neighbor, first_hop))
+    return None  # no path
+
+
+def bfs_shortest_path(start: int, goal: int) -> List[int]:
+    """Return the full shortest path from start to goal (inclusive)."""
+    if start == goal:
+        return [start]
+    visited = {start}
+    queue = deque()
+    queue.append((start, [start]))
+    while queue:
+        current, path = queue.popleft()
+        for neighbor in ADJ_LIST.get(current, []):
+            if neighbor == goal:
+                return path + [neighbor]
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append((neighbor, path + [neighbor]))
+    return [start]  # fallback
+
+
+# ── System Prompt ────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """\
+You are a strict logistics dispatcher. You control ONE vehicle in a delivery network.
+You MUST follow the decision tree below EXACTLY. No creativity. No deviation.
+
+## STRICT DECISION TREE (follow in order, stop at the FIRST match)
+
+1. IF vehicle status == "moving" → output WAIT. NOTHING ELSE. EVER.
+2. IF vehicle status == "broken" → output WAIT.
+3. IF vehicle status == "idle":
+   a. IF you are at the dropoff_node of an order you are carrying → output DELIVER for that order.
+   b. IF you are at the pickup_node of a queued order and you are NOT carrying it → output PICKUP for that order.
+   c. IF you are carrying an order → output ASSIGN to the RECOMMENDED NEXT HOP (given in the observation).
+   d. IF you are NOT carrying anything and there is a queued order → output ASSIGN to the RECOMMENDED NEXT HOP toward the pickup node.
+   e. IF nothing else applies → output WAIT.
+
+## CRITICAL RULES
+
+- WHEN MOVING: YOU MUST OUTPUT WAIT. Any other action wastes fuel and gets rejected.
+- BACKTRACKING IS FORBIDDEN: If "PREVIOUS NODE" is listed, NEVER assign to that node.
+- Only move to ADJACENT nodes (listed in the observation).
+- Follow the RECOMMENDED action from the ACTION DIRECTIVE section exactly.
+
+## OUTPUT FORMAT
+Return ONLY a single JSON object. No explanation, no markdown, no extra text.
+Examples:
+{"vehicle_id": "v1", "action_type": "wait"}
+{"vehicle_id": "v1", "action_type": "pickup", "order_id": "easy_1"}
+{"vehicle_id": "v1", "action_type": "assign", "target_node": 2}
+{"vehicle_id": "v1", "action_type": "deliver", "order_id": "easy_1"}
+"""
+
+
+# ── Observation Serializer ───────────────────────────────────────────────────
+
+def serialize_observation(
+    obs_dict: Dict[str, Any],
+    previous_node: Optional[int] = None,
+) -> str:
+    """Convert an observation dict into a structured text prompt for the LLM.
+
+    Includes an ACTION DIRECTIVE section that tells the LLM exactly what to do,
+    eliminating ambiguity and preventing ping-pong behavior.
     """
-    You are a state-aware logistics dispatcher in the Santacruz LMLC environment.
+    lines: List[str] = []
+    lines.append(f"=== TIMESTEP {obs_dict.get('timestep', '?')} ===\n")
 
-    **Graph (directed edges with base travel times):**
-    - 0 (Station) → 1 (SV_Road) [5 min]
-    - 1 (SV_Road) → 0 (Station) [5 min]
-    - 1 (SV_Road) → 2 (Linking_Road) [4 min]
-    - 2 (Linking_Road) → 1 (SV_Road) [4 min]
-    - 2 (Linking_Road) → 3 (Juhu_Tara) [7 min]
-    - 3 (Juhu_Tara) → 2 (Linking_Road) [7 min]
+    # ── Vehicles ─────────────────────────────────────────────────────
+    vehicles = obs_dict.get("vehicles", [])
+    lines.append("VEHICLES:")
+    for v in vehicles:
+        dest = f" → node {v['destination_node']}" if v.get("destination_node") is not None else ""
+        etr = f" (ETA: {v['time_to_arrival']:.1f} steps)" if v.get("status") == "moving" else ""
+        load = f", carrying: {v['current_load']}" if v.get("current_load") else ", carrying: NOTHING"
+        lines.append(
+            f"  {v['id']}: at node {v['location_node']}{dest} | "
+            f"status={v['status']}{etr} | fuel={v.get('fuel', 0):.1f} | "
+            f"capacity={v['capacity']}{load}"
+        )
 
-    STRICT DECISION POLICY (FOLLOW EXACTLY):
+    # ── Orders ───────────────────────────────────────────────────────
+    lines.append("\nORDERS:")
+    for o in obs_dict.get("active_orders", []):
+        lines.append(
+            f"  {o['id']}: pickup=node {o['pickup_node']} → dropoff=node {o['dropoff_node']} | "
+            f"status={o['status']} | priority={o['priority']} | deadline=step {o['deadline']}"
+        )
 
-    Step 1: Check vehicle status
+    # ── Traffic (only noteworthy edges) ──────────────────────────────
+    traffic = obs_dict.get("traffic_map", {})
+    high_traffic = {k: v for k, v in traffic.items() if v > 1.0}
+    if high_traffic:
+        lines.append("\nTRAFFIC (edges with multiplier > 1.0):")
+        for edge, mult in sorted(high_traffic.items(), key=lambda x: -x[1]):
+            severity = "🔴 HEAVY" if mult > 3.0 else "🟡 moderate"
+            lines.append(f"  edge {edge}: {mult:.2f}x ({severity})")
+    else:
+        lines.append("\nTRAFFIC: all edges clear (1.0x)")
 
-    * If status == "moving":
-      → You MUST output:
-      {"type": "WAIT", "payload": {}}
-      → Do NOT assign or reroute
+    # ── ACTION DIRECTIVE (the key anti-ping-pong section) ────────────
+    lines.append("\n" + "=" * 50)
+    lines.append("=== ACTION DIRECTIVE (FOLLOW THIS EXACTLY) ===")
+    lines.append("=" * 50)
 
-    Step 2: If status == "idle":
+    if not vehicles:
+        lines.append("ERROR: No vehicles found.")
+        return "\n".join(lines)
 
-    * If vehicle is at pickup node of an undelivered order:
-      → assign next hop toward drop node
+    v = vehicles[0]  # Primary vehicle
+    vid = v["id"]
+    status = v["status"]
+    location = v["location_node"]
+    load = v.get("current_load", [])
+    neighbors = ADJ_LIST.get(location, [])
 
-    Step 3: Multi-hop routing rule
+    if status == "moving":
+        # ── MOVING: Force WAIT ───────────────────────────────────────
+        dest = v.get("destination_node", "?")
+        eta = v.get("time_to_arrival", "?")
+        lines.append(f"Vehicle Status: MOVING to Node {dest} (ETA: {eta} steps)")
+        lines.append("⛔ YOU MUST OUTPUT WAIT. The vehicle is in transit.")
+        lines.append(f'REQUIRED OUTPUT: {{"vehicle_id": "{vid}", "action_type": "wait"}}')
 
-    * You CANNOT jump directly to destination
-    * Example: 0 → 2 requires:
-      Step A: assign to 1
-      Step B: wait until arrival
-      Step C: assign to 2
+    elif status == "broken":
+        lines.append("Vehicle Status: BROKEN")
+        lines.append(f'REQUIRED OUTPUT: {{"vehicle_id": "{vid}", "action_type": "wait"}}')
 
-    Step 4: Reroute rule
+    elif status == "idle":
+        lines.append(f"Vehicle Status: IDLE at Node {location}")
+        lines.append(f"Adjacent nodes: {neighbors}")
+        if previous_node is not None:
+            lines.append(f"Previous node: {previous_node} (⛔ FORBIDDEN — do NOT go back here)")
+        lines.append(f"Current load: {load if load else 'EMPTY'}")
 
-    * Only reroute if traffic multiplier > 3.0
-    * Otherwise NEVER reroute
+        orders = obs_dict.get("active_orders", [])
 
-    Step 5: Anti-loop rule (CRITICAL)
+        # Priority 1: Can we DELIVER?
+        deliverable = [
+            o for o in orders
+            if o["status"] == "assigned"
+            and o["id"] in load
+            and o["dropoff_node"] == location
+        ]
+        if deliverable:
+            oid = deliverable[0]["id"]
+            lines.append(f"\n✅ ACTION: DELIVER order '{oid}' — you are at its dropoff node!")
+            lines.append(f'REQUIRED OUTPUT: {{"vehicle_id": "{vid}", "action_type": "deliver", "order_id": "{oid}"}}')
 
-    * Do NOT repeat ASSIGN if vehicle is already moving
-    * Repeated ASSIGN = invalid behavior
+        else:
+            # Priority 2: Can we PICKUP?
+            pickupable = [
+                o for o in orders
+                if o["status"] == "queued"
+                and o["pickup_node"] == location
+            ]
+            if pickupable:
+                oid = pickupable[0]["id"]
+                lines.append(f"\n✅ ACTION: PICKUP order '{oid}' — you are at its pickup node!")
+                lines.append(f'REQUIRED OUTPUT: {{"vehicle_id": "{vid}", "action_type": "pickup", "order_id": "{oid}"}}')
 
-    Goal:
-    Complete delivery for the active order with minimum steps.
+            else:
+                # Priority 3: Move toward goal
+                if load:
+                    # Carrying an order → move toward its dropoff
+                    carried_order = next(
+                        (o for o in orders if o["id"] == load[0] and o["status"] == "assigned"),
+                        None,
+                    )
+                    if carried_order:
+                        goal = carried_order["dropoff_node"]
+                        path = bfs_shortest_path(location, goal)
+                        next_hop = bfs_next_hop(location, goal)
 
-    ---
+                        # Anti-backtrack: if next_hop is the previous node, try alternate
+                        if next_hop == previous_node and len(path) > 2:
+                            # Try to find an alternate path avoiding previous_node
+                            alt_neighbors = [n for n in neighbors if n != previous_node]
+                            # Pick the neighbor closest to goal
+                            best_alt = None
+                            best_len = float("inf")
+                            for n in alt_neighbors:
+                                alt_path = bfs_shortest_path(n, goal)
+                                if len(alt_path) < best_len:
+                                    best_len = len(alt_path)
+                                    best_alt = n
+                            if best_alt is not None:
+                                next_hop = best_alt
 
-    Before outputting action:
+                        path_str = " → ".join(str(n) for n in path)
+                        lines.append(f"\nGoal: Deliver order '{load[0]}' to Node {goal}")
+                        lines.append(f"Shortest path: {path_str}")
+                        lines.append(f"✅ ACTION: ASSIGN to Node {next_hop}")
+                        lines.append(f'REQUIRED OUTPUT: {{"vehicle_id": "{vid}", "action_type": "assign", "target_node": {next_hop}}}')
+                    else:
+                        lines.append("\n⚠️ Carrying order but cannot find it in active orders. WAIT.")
+                        lines.append(f'REQUIRED OUTPUT: {{"vehicle_id": "{vid}", "action_type": "wait"}}')
 
-    * Check: Is vehicle moving?
-    * If YES → WAIT
-    * If NO → ASSIGN next valid hop
+                else:
+                    # Not carrying → move toward nearest queued order's pickup
+                    queued = [o for o in orders if o["status"] == "queued"]
+                    if queued:
+                        # Find nearest queued order
+                        nearest = min(
+                            queued,
+                            key=lambda o: len(bfs_shortest_path(location, o["pickup_node"])),
+                        )
+                        goal = nearest["pickup_node"]
 
-    ---
+                        if goal == location:
+                            # We're at pickup but didn't match above — pickup it
+                            lines.append(f"\n✅ ACTION: PICKUP order '{nearest['id']}'")
+                            lines.append(f'REQUIRED OUTPUT: {{"vehicle_id": "{vid}", "action_type": "pickup", "order_id": "{nearest["id"]}"}}')
+                        else:
+                            path = bfs_shortest_path(location, goal)
+                            next_hop = bfs_next_hop(location, goal)
 
-    Output ONLY valid JSON:
-    {
-    "type": "...",
-    "payload": {...}
-    }
+                            # Anti-backtrack
+                            if next_hop == previous_node:
+                                alt_neighbors = [n for n in neighbors if n != previous_node]
+                                best_alt = None
+                                best_len = float("inf")
+                                for n in alt_neighbors:
+                                    alt_path = bfs_shortest_path(n, goal)
+                                    if len(alt_path) < best_len:
+                                        best_len = len(alt_path)
+                                        best_alt = n
+                                if best_alt is not None:
+                                    next_hop = best_alt
+
+                            path_str = " → ".join(str(n) for n in path)
+                            lines.append(f"\nGoal: Go to pickup node {goal} for order '{nearest['id']}'")
+                            lines.append(f"Shortest path: {path_str}")
+                            lines.append(f"✅ ACTION: ASSIGN to Node {next_hop}")
+                            lines.append(f'REQUIRED OUTPUT: {{"vehicle_id": "{vid}", "action_type": "assign", "target_node": {next_hop}}}')
+                    else:
+                        # No queued orders, nothing to do
+                        lines.append("\nNo pending orders. WAIT.")
+                        lines.append(f'REQUIRED OUTPUT: {{"vehicle_id": "{vid}", "action_type": "wait"}}')
+
+    return "\n".join(lines)
+
+
+# ── LLM Action Parser ───────────────────────────────────────────────────────
+
+def _extract_json(text: str) -> Optional[Dict]:
+    """Extract a JSON object from LLM response text, handling code fences."""
+    # Try to find JSON inside markdown code fences first
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence_match:
+        return json.loads(fence_match.group(1))
+
+    # Try to find a raw JSON object
+    brace_match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+    if brace_match:
+        return json.loads(brace_match.group(0))
+
+    # Last resort: try parsing the whole text
+    return json.loads(text.strip())
+
+
+def get_llm_action(
+    obs_dict: Dict[str, Any],
+    previous_node: Optional[int] = None,
+) -> tuple[LastMileAction, Optional[str]]:
     """
-).strip()
+    Query the LLM for the next action.
 
+    Returns:
+        (action, error_msg)  – error_msg is None on success, else a description.
+        On failure the action is a WAIT fallback.
+    """
+    # Determine a default vehicle_id for fallback
+    vehicles = obs_dict.get("vehicles", [])
+    fallback_vid = vehicles[0]["id"] if vehicles else "v1"
 
-def log_start(task: str, env: str, model: str) -> None:
-    print(f"[START] task={task} env={env} model={model}", flush=True)
-
-
-def log_step(step: int, action: str, reward: float, done: bool, result: Optional[Any] = None) -> None:
-    print(f"\n--- STEP {step} ---", flush=True)
-    print(f"Action: {action}", flush=True)
-    print(f"Reward: {reward:.2f}", flush=True)
-    print(f"Done: {str(done).lower()}", flush=True)
-    
-    if result and hasattr(result, "observation"):
-        obs = result.observation
-        print("Vehicles Status:", flush=True)
-        for v in obs.vehicles:
-            dest = f" -> {v.destination_node}" if v.destination_node is not None else ""
-            etr = f" (ETR: {v.time_to_arrival:.1f})" if v.status == "moving" else ""
-            print(f"  - {v.id}: {v.location_node}{dest} [{v.status}]{etr}", flush=True)
-        
-        print("Active Orders:", flush=True)
-        for o in obs.active_orders:
-            print(f"  - {o.id}: {o.pickup_node}->{o.dropoff_node} [{o.status}] Priority: {o.priority} Deadline: {o.deadline}", flush=True)
-        
-        high_traffic = {k: v for k, v in obs.traffic_map.items() if v > 1.5}
-        if high_traffic:
-            print("High Traffic:", flush=True)
-            for edge, mult in high_traffic.items():
-                print(f"  - {edge}: {mult:.2f}x", flush=True)
-    print("-" * 15, flush=True)
-
-
-def log_end(success: bool, steps: int, rewards: List[float]) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else "0.00"
-    print(
-        f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}",
-        flush=True,
-    )
-
-def get_agent_action(client: OpenAI, obs_json: str) -> LastMileAction:
     try:
-        completion = client.chat.completions.create(
+        user_message = serialize_observation(obs_dict, previous_node=previous_node)
+
+        response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Current State:\n{obs_json}"},
+                {"role": "user", "content": user_message},
             ],
-            temperature=TEMPERATURE,
-            response_format={"type": "json_object"},
+            temperature=0.0,  # Deterministic — no creativity needed
+            max_tokens=128,   # Short response — just a JSON object
         )
-        content = completion.choices[0].message.content
-        
-        print(f"\nDEBUG LLM Action Decision:", flush=True)
-        print(f"Response: {content}", flush=True) 
-        
-        data = json.loads(content)
-        
-        # Ensure data is a dictionary before unpacking
-        if not isinstance(data, dict):
-            raise ValueError("LLM did not return a JSON object")
-            
-        if "type" in data and "payload" in data:
-            action_type = data.get("type", "wait").lower()
-            payload = data.get("payload", {})
-            target_node = payload.get("target_node")
-            if target_node is None:
-                target_node = payload.get("next_hop")
-            if target_node is None:
-                target_node = payload.get("next_node")
-            if target_node is None:
-                target_node = payload.get("destination_node")
-                
-            return LastMileAction(
-                vehicle_id=payload.get("vehicle_id", "v1"),
-                action_type=action_type,
-                target_node=target_node,
-                order_id=payload.get("order_id")
-            )
-            
-        return LastMileAction(**data)
 
+        raw = response.choices[0].message.content.strip()
+        parsed = _extract_json(raw)
+        action = LastMileAction(**parsed)
+        return action, None
+
+    except json.JSONDecodeError as e:
+        error = f"JSON parse error: {e}"
     except Exception as e:
-        # CRITICAL: Print the error so you know if it's a Credit Limit issue
-        print(f"[ERROR] Agent Action Failed: {e}", flush=True)
-        
-        # Fallback: Explicitly use None for optional fields to avoid Server validation errors
-        return LastMileAction(
-            vehicle_id="v1", 
-            action_type="wait", 
-            target_node=None, 
-            order_id=None
-        )
+        error = f"LLM error: {e}"
+
+    # Fallback: WAIT
+    fallback = LastMileAction(
+        vehicle_id=fallback_vid,
+        action_type="wait",
+        target_node=None,
+        order_id=None,
+    )
+    return fallback, error
+
+
+# ── Stdout Formatters ────────────────────────────────────────────────────────
+
+def emit_start(task: str, model: str) -> None:
+    print(
+        f"[START] task={task} env={BENCHMARK} model={model}",
+        flush=True,
+    )
+
+
+def emit_step(
+    step: int,
+    action: str,
+    reward: float,
+    done: bool,
+    error: Optional[str] = None,
+) -> None:
+    err_str = "null" if error is None else error
+    print(
+        f"[STEP] step={step} action={action} "
+        f"reward={reward:.2f} done={str(done).lower()} "
+        f"error={err_str}",
+        flush=True,
+    )
+
+
+def emit_end(success: bool, steps: int, rewards: List[float]) -> None:
+    reward_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} "
+        f"rewards={reward_str}",
+        flush=True,
+    )
+
+
+# ── Main Loop ────────────────────────────────────────────────────────────────
 
 async def main() -> None:
     rewards: List[float] = []
     steps_taken = 0
-    score = 0.0
     success = False
 
-    if not API_KEY:
-        print("[ERROR] HF_TOKEN or API_KEY not found in environment.")
-        return
-
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    # Movement history tracking for anti-backtracking
+    previous_node: Optional[int] = None
+    last_known_location: Optional[int] = None
 
     async with LastMileEnv(base_url="http://localhost:8000") as env:
-        log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+        emit_start(task=TASK_NAME, model=MODEL_NAME)
 
         try:
-            result = await env.reset()
+            # Reset with the correct task scenario
+            result = await env.reset(task_id=TASK_NAME)
 
             for step in range(1, MAX_STEPS + 1):
                 if result.done:
                     break
 
-                obs_json = result.observation.model_dump_json()
-                action = get_agent_action(client, obs_json)
+                obs_dict = json.loads(result.observation.model_dump_json())
 
-                # Add a small delay to prevent Rate Limits
-                await asyncio.sleep(1)
+                # Track vehicle location for anti-backtracking
+                vehicles = obs_dict.get("vehicles", [])
+                if vehicles:
+                    current_location = vehicles[0]["location_node"]
+                    current_status = vehicles[0]["status"]
 
+                    # Update previous_node only when the vehicle has ARRIVED
+                    # at a new location (status is idle and location changed)
+                    if current_status == "idle" and last_known_location is not None and current_location != last_known_location:
+                        previous_node = last_known_location
+
+                    if current_status == "idle":
+                        last_known_location = current_location
+
+                # Ask the LLM for the next action
+                action, error = get_llm_action(obs_dict, previous_node=previous_node)
+
+                # Execute the action in the environment
                 result = await env.step(action)
 
                 reward = result.reward or 0.0
                 rewards.append(reward)
                 steps_taken = step
 
-                log_step(
+                # Build a concise action string
+                act_type = action.action_type
+                action_str = act_type.value if hasattr(act_type, "value") else str(act_type)
+                if action.target_node is not None:
+                    action_str += f"({action.target_node})"
+                if action.order_id is not None:
+                    action_str += f"[{action.order_id}]"
+
+                emit_step(
                     step=step,
-                    action=action.action_type,
+                    action=action_str,
                     reward=reward,
                     done=result.done,
-                    result=result,
+                    error=error,
                 )
 
+                # Check for episode completion
                 if result.done:
-                    # Extract grader score from metadata if available
-                    if hasattr(result, "observation") and result.observation.metadata:
-                        score = result.observation.metadata.get("final_score", 0.0)
-                        success = score > 0.4
+                    meta = getattr(result.observation, "metadata", {}) or {}
+                    if meta.get("final_score"):
+                        success = meta["final_score"] > 0.4
+                    else:
+                        all_delivered = all(
+                            o.status == "delivered"
+                            for o in result.observation.active_orders
+                        )
+                        success = all_delivered and bool(
+                            result.observation.active_orders
+                        )
                     break
 
-            # Fallback scoring if grader score not available
-            if score == 0.0 and rewards:
-                total_reward = sum(rewards)
-                score = min(max(total_reward / 50.0, 0.0), 1.0)
-                success = score > 0.4
-
         except Exception as e:
-            print(f"[ERROR] Inference loop failed: {e}", flush=True)
+            # Emit a final error step
+            emit_step(
+                step=steps_taken + 1,
+                action="wait",
+                reward=0.0,
+                done=True,
+                error=str(e),
+            )
         finally:
-            log_end(success=success, steps=steps_taken, rewards=rewards)
+            emit_end(success=success, steps=steps_taken, rewards=rewards)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ class LastMileEnv(EnvClient[LastMileAction, LastMileObservation, State]):
         # validation succeeds.
         obs_data.setdefault("done", payload.get("done", False))
         obs_data.setdefault("reward", payload.get("reward", 0.0))
+        obs_data.setdefault("metadata", payload.get("metadata", {}))
 
         observation = LastMileObservation(**obs_data)
         

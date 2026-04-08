@@ -24,8 +24,8 @@ RUN apt-get update && \
 ARG BUILD_MODE=in-repo
 ARG ENV_NAME=last_mile_env
 
-# Copy environment code (always at root of build context)
-COPY . /app/env
+# Copy environment code from the nested directory
+COPY last_mile_env /app/env
 
 # For in-repo builds, openenv is already vendored in the build context
 # For standalone builds, openenv will be installed via pyproject.toml

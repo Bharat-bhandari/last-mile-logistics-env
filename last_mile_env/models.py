@@ -11,11 +11,12 @@ class VehicleStatus(str, Enum):
 class Vehicle(BaseModel):
     id: str
     location_node: int
-    current_load: List[str] = [] # Fixed: was current_load: int
+    current_load: List[str] = []
     capacity: int
     status: VehicleStatus
     destination_node: Optional[int] = None
-    time_to_arrival: float = 0.0 # New: Visible "countdown" for agent planning
+    time_to_arrival: float = 0.0
+    fuel: float = 100.0  # Fuel resource — burns per step, 0 = BROKEN
 
 class Order(BaseModel):
     id: str
@@ -30,6 +31,7 @@ class LastMileObservation(BaseModel):
     vehicles: List[Vehicle]
     active_orders: List[Order]
     traffic_map: Dict[str, float]
+    graph_adjacency: Dict[int, List[Dict[str, Any]]] = {}  # Agent sees the full graph
     done: bool
     reward: float
     metadata: Dict[str, Any] = {}
@@ -38,6 +40,8 @@ class ActionType(str, Enum):
     ASSIGN = "assign"
     REROUTE = "reroute"
     WAIT = "wait"
+    PICKUP = "pickup"
+    DELIVER = "deliver"
 
 class LastMileAction(BaseModel):
     vehicle_id: str

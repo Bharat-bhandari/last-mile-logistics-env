@@ -1,8 +1,12 @@
 import logging
 from typing import List, Dict, Any
-from .models import Order, Vehicle, VehicleStatus
+try:
+    from .models import Order, Vehicle, VehicleStatus
+except ImportError:
+    from models import Order, Vehicle, VehicleStatus
 
 logger = logging.getLogger("LastMileTasks")
+
 
 class BaseGrader:
     """Deterministic scorer for Logistics Tasks."""
@@ -26,8 +30,27 @@ class BaseGrader:
             0.3 * (on_time_count / len(orders))
         )
         final_score = round(min(max(score, 0.0), 1.0), 2)
-        logger.info(f"Final score calculated: {final_score} (Delivered: {delivered_count}/{len(orders)}, On-time: {on_time_count}/{len(orders)})")
+        logger.info(
+            f"Final score: {final_score} "
+            f"(Delivered: {delivered_count}/{len(orders)}, "
+            f"On-time: {on_time_count}/{len(orders)}, Steps: {total_steps})"
+        )
         return final_score
+
+
+# =============================================================================
+# Tasks — using 8-node Santacruz graph
+#
+#  Nodes:
+#    0: Station          4: Vakola
+#    1: SV_Road          5: Kalina
+#    2: Linking_Road     6: BKC_Connector
+#    3: Juhu_Tara        7: Vile_Parle_Link
+#
+#  Main corridor (traffic-heavy): 0→1→2→3
+#  South bypass: 0→4→5→6→3
+#  North bypass: 0→7→2→3
+# =============================================================================
 
 
 class Task1Easy:
@@ -45,14 +68,15 @@ class Task1Easy:
                     capacity=5,
                     current_load=[],
                     status=VehicleStatus.IDLE,
+                    fuel=100.0,
                 )
             ],
             "orders": [
                 Order(
                     id="easy_1",
                     pickup_node=0,
-                    dropoff_node=2,
-                    deadline=100,
+                    dropoff_node=3,
+                    deadline=80,
                     priority=1,
                     status="queued",
                 )
@@ -63,7 +87,7 @@ class Task1Easy:
 
 
 class Task2Medium:
-    """Scenario: Multiple orders, dynamic traffic spikes on SV Road (Node 1)."""
+    """Scenario: Multiple orders, two vehicles, dynamic traffic on SV Road."""
 
     SEED = 200
 
@@ -77,13 +101,15 @@ class Task2Medium:
                     capacity=5,
                     current_load=[],
                     status=VehicleStatus.IDLE,
+                    fuel=100.0,
                 ),
                 Vehicle(
                     id="v2",
-                    location_node=2,
+                    location_node=3,
                     capacity=5,
                     current_load=[],
                     status=VehicleStatus.IDLE,
+                    fuel=100.0,
                 ),
             ],
             "orders": [
@@ -91,15 +117,15 @@ class Task2Medium:
                     id="med_1",
                     pickup_node=0,
                     dropoff_node=3,
-                    deadline=60,
+                    deadline=50,
                     priority=2,
                     status="queued",
                 ),
                 Order(
                     id="med_2",
-                    pickup_node=1,
+                    pickup_node=3,
                     dropoff_node=0,
-                    deadline=80,
+                    deadline=60,
                     priority=3,
                     status="queued",
                 ),
@@ -110,7 +136,14 @@ class Task2Medium:
 
 
 class Task3Hard:
-    """Scenario: High-pressure logistics. Tight deadlines and non-stationary traffic."""
+    """
+    Scenario: High-pressure logistics.
+    - Single vehicle, 3 orders across the map.
+    - Tight deadlines that are ONLY achievable if the agent avoids the
+      congested main corridor (0→1→2→3) and uses bypasses.
+    - extreme_stochastic traffic: 40% spike chance on SV Road edges (@3-8x).
+    - Fuel constraint forces efficiency — no room for aimless exploration.
+    """
 
     SEED = 300
 
@@ -124,30 +157,36 @@ class Task3Hard:
                     capacity=10,
                     current_load=[],
                     status=VehicleStatus.IDLE,
+                    fuel=80.0,  # Tighter fuel budget
                 )
             ],
             "orders": [
+                # Order 1: Station → Juhu_Tara (must cross the map)
+                # Deadline is tight: main corridor @ 1x takes ~12 steps minimum,
+                # but with 3-8x traffic on SV Road it can balloon to 30+
                 Order(
                     id="h1",
                     pickup_node=0,
                     dropoff_node=3,
-                    deadline=30,
+                    deadline=25,
                     priority=3,
                     status="queued",
                 ),
+                # Order 2: BKC_Connector → Station (reverse direction, south bypass)
                 Order(
                     id="h2",
-                    pickup_node=3,
-                    dropoff_node=1,
+                    pickup_node=6,
+                    dropoff_node=0,
                     deadline=50,
                     priority=2,
                     status="queued",
                 ),
+                # Order 3: Vile_Parle_Link → Kalina (cross-map lateral)
                 Order(
                     id="h3",
-                    pickup_node=2,
-                    dropoff_node=0,
-                    deadline=70,
+                    pickup_node=7,
+                    dropoff_node=5,
+                    deadline=65,
                     priority=1,
                     status="queued",
                 ),

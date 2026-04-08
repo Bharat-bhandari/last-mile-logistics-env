@@ -31,20 +31,18 @@ TASK_REGISTRY = {
 class ManagedLastMileEnvironment(LastMileEnvironment):
     """
     Extends LastMileEnvironment to support task-based resets.
-    Reads task_id from the options dict passed to reset, falling back to
-    the LMLC_TASK environment variable, then defaulting to 'easy'.
+
+    The reset() signature matches OpenEnv's Environment ABC so that the
+    framework's _get_valid_kwargs correctly passes all client-supplied
+    kwargs (including task_id) through to this method.
     """
 
-    def reset(self, options: Optional[Dict[str, Any]] = None) -> Any:
+    def reset(self, seed=None, episode_id=None, **kwargs) -> Any:
         # Base reset: clears vehicles, orders, resets state
-        super().reset()
+        super().reset(seed=seed, episode_id=episode_id, **kwargs)
 
-        # Determine task: options dict > env var > default
-        task_name = "easy"
-        if options and "task_id" in options:
-            task_name = options["task_id"]
-        else:
-            task_name = os.getenv("LMLC_TASK", "easy").lower()
+        # Determine task: kwargs > env var > default
+        task_name = kwargs.get("task_id", os.getenv("LMLC_TASK", "easy")).lower()
 
         task = TASK_REGISTRY.get(task_name, TASK_REGISTRY["easy"])
         scenario = task.get_init_state()
@@ -54,15 +52,22 @@ class ManagedLastMileEnvironment(LastMileEnvironment):
         self.orders = scenario["orders"]
 
         # Seed RNG deterministically for this task
-        seed = scenario.get("seed", 42)
-        self._rng = random.Random(seed)
+        task_seed = scenario.get("seed", seed or 42)
+        self._rng = random.Random(task_seed)
 
         # Apply traffic config
-        traffic_config = scenario.get("traffic_config", "dynamic_medium")
-        if traffic_config == "static_low":
+        self.traffic_config = scenario.get("traffic_config", "dynamic_medium")
+        if self.traffic_config == "static_low":
             for k in self.traffic_multipliers:
                 self.traffic_multipliers[k] = 1.0
         # Other configs start at 1.0 and evolve via _update_traffic()
+
+        import logging
+        logging.getLogger("LastMileEnv").info(
+            f"Reset complete — task={task_name}, "
+            f"vehicles={len(self.vehicles)}, orders={len(self.orders)}, "
+            f"traffic_config={self.traffic_config}"
+        )
 
         return self._get_obs(reward=0.0)
 
@@ -82,9 +87,5 @@ def main(host: str = "0.0.0.0", port: int = 8000):
     uvicorn.run(app, host=host, port=port)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LMLC Environment Server")
-    parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
-    args = parser.parse_args()
-    main(host=args.host, port=args.port)
+if __name__ == '__main__':
+    main()
