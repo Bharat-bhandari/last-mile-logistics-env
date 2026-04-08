@@ -492,7 +492,9 @@ async def main() -> None:
                 if result.done:
                     meta = getattr(result.observation, "metadata", {}) or {}
                     if meta.get("final_score") is not None:
-                        score = float(meta["final_score"])
+                        # Clamp server-reported score to strict range (0.05, 0.95)
+                        raw = float(meta["final_score"])
+                        score = round(min(max(raw, 0.05), 0.95), 4)
                         success = score > 0.4
                     else:
                         all_delivered = all(
@@ -502,7 +504,8 @@ async def main() -> None:
                         success = all_delivered and bool(
                             result.observation.active_orders
                         )
-                        score = 1.0 if success else 0.0
+                        # Strict range: never emit 0.0 or 1.0
+                        score = 0.95 if success else 0.05
                     break
 
         except Exception as e:

@@ -9,7 +9,16 @@ logger = logging.getLogger("LastMileTasks")
 
 
 class BaseGrader:
-    """Deterministic scorer for Logistics Tasks."""
+    """Deterministic scorer for Logistics Tasks.
+
+    Score is always strictly in (0.05, 0.95) — never 0 or 1 — as required
+    by the OpenEnv strict-range validation rule.
+
+    Components:
+      - 70% delivery rate  (how many orders were delivered)
+      - 20% on-time rate   (deliveries made before deadline)
+      - 10% fuel efficiency (fuel remaining / starting fuel, averaged over vehicles)
+    """
 
     def calculate_score(
         self,
@@ -18,22 +27,44 @@ class BaseGrader:
         total_steps: int,
     ) -> float:
         if not orders:
-            return 0.0
+            # No orders — return the minimum safe floor
+            return 0.05
 
         delivered_count = sum(1 for o in orders if o.status == "delivered")
         on_time_count = sum(
             1 for o in orders if o.status == "delivered" and o.deadline >= total_steps
         )
 
-        # Weighted Score: 70% Delivery Success, 30% On-Time Efficiency
-        score = (0.7 * (delivered_count / len(orders))) + (
-            0.3 * (on_time_count / len(orders))
+        delivery_rate = delivered_count / len(orders)
+        on_time_rate = on_time_count / len(orders)
+
+        # Fuel efficiency: average fraction of fuel remaining
+        # (falls back to 0.0 if no vehicles or starting fuel is 0)
+        if vehicles:
+            fuel_efficiency = sum(
+                v.fuel / 100.0 for v in vehicles
+            ) / len(vehicles)
+            # Cap between 0 and 1 in case fuel exceeded cap
+            fuel_efficiency = max(0.0, min(fuel_efficiency, 1.0))
+        else:
+            fuel_efficiency = 0.0
+
+        # Weighted composite score  (0.7 + 0.2 + 0.1 = 1.0)
+        raw_score = (
+            0.70 * delivery_rate
+            + 0.20 * on_time_rate
+            + 0.10 * fuel_efficiency
         )
-        final_score = round(min(max(score, 0.0), 1.0), 2)
+
+        # Strict range: clamp to (0.05, 0.95) — never 0 or 1
+        final_score = round(min(max(raw_score, 0.05), 0.95), 4)
+
         logger.info(
             f"Final score: {final_score} "
             f"(Delivered: {delivered_count}/{len(orders)}, "
-            f"On-time: {on_time_count}/{len(orders)}, Steps: {total_steps})"
+            f"On-time: {on_time_count}/{len(orders)}, "
+            f"Fuel efficiency: {fuel_efficiency:.2f}, "
+            f"Steps: {total_steps})"
         )
         return final_score
 
